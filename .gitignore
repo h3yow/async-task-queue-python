@@ -7,3 +7,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# local task queue database (WAL/SHM sidecars)
+*.db
+*.db-wal
+*.db-shm
+tasks.db
