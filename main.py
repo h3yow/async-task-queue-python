@@ -1,8 +1,3 @@
-from fastapi import FastAPI
+from taskqueue.app import create_app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
