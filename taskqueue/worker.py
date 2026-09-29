@@ -72,6 +72,16 @@ class Worker:
                 "recovered orphaned running task after restart",
                 extra={"task_id": tid, "attempts": "-", "decision": "RECOVER"},
             )
+        # 启动恢复：重新评估所有 BLOCKED 任务。
+        # 上次进程可能在“上游落终态”与“传播到下游”之间崩溃，
+        # 这里补做传播，保证流程不卡住；已成功的上游不会因此重跑。
+        refreshed = await run_db(self.store.refresh_blocked, time.time())
+        for tid, decision in refreshed:
+            self.logger.info(
+                "flow dependency resolved at startup",
+                extra={"task_id": tid, "attempts": "-",
+                       "decision": f"FLOW_RECOVER {decision}"},
+            )
         self._stop.clear()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="worker-poll")
         self.logger.info(
@@ -271,6 +281,7 @@ class Worker:
                 extra={"task_id": task.id, "attempts": task.attempts,
                        "decision": "SUCCEEDED"},
             )
+            await self._propagate(task.id)
         else:
             # 状态已被并发改动（例如取消/恢复），不能静默成功
             self.logger.error(
@@ -308,12 +319,16 @@ class Worker:
         if cancelled:
             ok = await self._update(task, TaskState.CANCELLED, **error_fields)
             self._log_outcome(task, attempts, "CANCELLED", ok, error_message)
+            if ok:
+                await self._propagate(task.id)
             return
 
         if not retryable:
             ok = await self._update(task, TaskState.FAILED, **error_fields)
             self._log_outcome(task, attempts, "FAILED_NON_RETRYABLE", ok,
                               error_message)
+            if ok:
+                await self._propagate(task.id)
             return
 
         # 可重试：判断是否还有下一次机会
@@ -340,6 +355,20 @@ class Worker:
         # 重试耗尽 -> 死信
         ok = await self._update(task, TaskState.DEAD_LETTER, **error_fields)
         self._log_outcome(task, attempts, "DEAD_LETTER", ok, error_message)
+        if ok:
+            await self._propagate(task.id)
+
+    async def _propagate(self, task_id: str) -> None:
+        """任务进入终态后带动下游：放行依赖已满足的，带停依赖已失败的。"""
+        decisions = await run_db(
+            self.store.propagate_from, task_id, time.time()
+        )
+        for tid, decision in decisions:
+            self.logger.info(
+                "flow dependency propagated",
+                extra={"task_id": tid, "attempts": "-",
+                       "decision": f"FLOW_{decision}"},
+            )
 
     def _log_outcome(
         self, task: Task, attempts: int, decision: str, ok: bool, message: str

@@ -16,12 +16,14 @@ from pydantic import BaseModel, Field
 from taskqueue.errors import (
     IdempotencyConflictError,
     InvalidStateTransitionError,
+    UnknownFlowError,
     UnknownTaskError,
     ValidationError,
 )
-from taskqueue.models import Task, TaskState
+from taskqueue.models import FlowState, FlowStatus, FlowTaskSpec, Task, TaskState
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+flow_router = APIRouter(prefix="/flows", tags=["flows"])
 
 
 # ---------- 请求 / 响应模型 ----------
@@ -54,6 +56,9 @@ class TaskResponse(BaseModel):
     updated_at: float
     started_at: float | None
     finished_at: float | None
+    flow_id: str | None
+    flow_key: str | None
+    blocked_by: str | None
 
     @classmethod
     def from_task(cls, task: Task) -> TaskResponse:
@@ -75,6 +80,48 @@ class TaskResponse(BaseModel):
             updated_at=task.updated_at,
             started_at=task.started_at,
             finished_at=task.finished_at,
+            flow_id=task.flow_id,
+            flow_key=task.flow_key,
+            blocked_by=task.blocked_by,
+        )
+
+
+# ---------- 流程（依赖编排）请求 / 响应模型 ----------
+
+
+class FlowTaskSpecRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=200)
+    task_type: str = Field(..., min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    depends_on: list[str] = Field(default_factory=list)
+    idempotency_key: str | None = Field(default=None, max_length=200)
+    priority: int = 0
+    max_attempts: int | None = Field(default=None, ge=1)
+    timeout: float | None = Field(default=None, gt=0)
+
+
+class FlowSubmitRequest(BaseModel):
+    tasks: list[FlowTaskSpecRequest] = Field(..., min_length=1)
+
+
+class FlowResponse(BaseModel):
+    flow_id: str
+    state: FlowState
+    total: int
+    counts: dict[str, int]
+    tasks: list[TaskResponse]
+
+    @classmethod
+    def from_flow(cls, flow: FlowStatus) -> FlowResponse:
+        counts: dict[str, int] = {}
+        for task in flow.tasks:
+            counts[task.state.value] = counts.get(task.state.value, 0) + 1
+        return cls(
+            flow_id=flow.flow_id,
+            state=flow.state,
+            total=flow.total,
+            counts=counts,
+            tasks=[TaskResponse.from_task(t) for t in flow.tasks],
         )
 
 
@@ -87,6 +134,11 @@ def _raise_domain_error(exc: Exception) -> None:
         raise HTTPException(status_code=404, detail={
             "error": "unknown_task", "message": str(exc),
             "task_id": getattr(exc, "task_id", None),
+        })
+    if isinstance(exc, UnknownFlowError):
+        raise HTTPException(status_code=404, detail={
+            "error": "unknown_flow", "message": str(exc),
+            "flow_id": exc.flow_id,
         })
     if isinstance(exc, InvalidStateTransitionError):
         raise HTTPException(status_code=409, detail={
@@ -159,3 +211,41 @@ async def cancel_task(task_id: str, request: Request) -> TaskResponse:
         _raise_domain_error(exc)
         raise
     return TaskResponse.from_task(task)
+
+
+# ---------- 流程路由 ----------
+
+
+@flow_router.post("", response_model=FlowResponse, status_code=201)
+async def submit_flow(req: FlowSubmitRequest, request: Request) -> FlowResponse:
+    service = _get_service(request)
+    specs = [
+        FlowTaskSpec(
+            key=t.key,
+            task_type=t.task_type,
+            payload=t.payload,
+            depends_on=list(t.depends_on),
+            priority=t.priority,
+            max_attempts=t.max_attempts,
+            timeout=t.timeout,
+            idempotency_key=t.idempotency_key,
+        )
+        for t in req.tasks
+    ]
+    try:
+        flow = await service.submit_flow(specs)
+    except (IdempotencyConflictError, ValidationError) as exc:
+        _raise_domain_error(exc)
+        raise
+    return FlowResponse.from_flow(flow)
+
+
+@flow_router.get("/{flow_id}", response_model=FlowResponse)
+async def get_flow(flow_id: str, request: Request) -> FlowResponse:
+    service = _get_service(request)
+    try:
+        flow = await service.get_flow(flow_id)
+    except UnknownFlowError as exc:
+        _raise_domain_error(exc)
+        raise
+    return FlowResponse.from_flow(flow)

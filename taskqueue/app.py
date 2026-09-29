@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from taskqueue.api import flow_router
 from taskqueue.api import router as task_router
 from taskqueue.config import TaskQueueConfig
 from taskqueue.logging_setup import configure_logging
@@ -61,4 +62,5 @@ def create_app(
         return {"status": "ok"}
 
     app.include_router(task_router)
+    app.include_router(flow_router)
     return app

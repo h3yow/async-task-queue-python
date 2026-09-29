@@ -26,6 +26,14 @@ class UnknownTaskError(TaskQueueError):
         self.task_id = task_id
 
 
+class UnknownFlowError(TaskQueueError):
+    """查询了不存在的流程。"""
+
+    def __init__(self, flow_id: str):
+        super().__init__(f"unknown flow: {flow_id}")
+        self.flow_id = flow_id
+
+
 class InvalidStateTransitionError(TaskQueueError):
     """对处于非法状态的任务执行操作（如取消已终结任务）。"""
 

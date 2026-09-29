@@ -18,17 +18,25 @@ from taskqueue.dbutil import run_db
 from taskqueue.errors import (
     IdempotencyConflictError,
     InvalidStateTransitionError,
+    UnknownFlowError,
     UnknownTaskError,
     ValidationError,
 )
-from taskqueue.models import TERMINAL_STATES, Task, TaskState
+from taskqueue.models import (
+    TERMINAL_STATES,
+    FlowState,
+    FlowStatus,
+    FlowTaskSpec,
+    Task,
+    TaskState,
+)
 from taskqueue.registry import HandlerRegistry
 from taskqueue.retry import RetryPolicy
 from taskqueue.store import IdempotencyKeyTaken, TaskStore
 from taskqueue.worker import Worker
 
-# 取消时可直接落库的“排队中”状态
-_QUEUED_STATES = (TaskState.PENDING, TaskState.RETRY_WAIT)
+# 取消时可直接落库的“排队中”状态（BLOCKED 尚未占用任何执行资源）
+_QUEUED_STATES = (TaskState.PENDING, TaskState.RETRY_WAIT, TaskState.BLOCKED)
 
 
 class TaskService:
@@ -67,16 +75,14 @@ class TaskService:
 
     # ---------- 提交 ----------
 
-    async def submit(
+    def _check_common_params(
         self,
         task_type: str,
-        payload: dict[str, Any] | None = None,
-        idempotency_key: str | None = None,
-        priority: int = 0,
-        max_attempts: int | None = None,
-        timeout: float | None = None,
-    ) -> Task:
-        # --- 参数校验，失败原因可区分 ---
+        payload: dict[str, Any] | None,
+        priority: int,
+        max_attempts: int | None,
+        timeout: float | None,
+    ) -> None:
         if not isinstance(task_type, str) or not task_type:
             raise ValidationError("task_type must be a non-empty string")
         if payload is not None and not isinstance(payload, dict):
@@ -93,11 +99,30 @@ class TaskService:
         if task_type not in self.registry:
             raise ValidationError(f"unknown task_type: {task_type}")
 
-        payload = payload or {}
-        attempts_cap = max_attempts if max_attempts is not None \
+    def _attempts_cap(self, max_attempts: int | None) -> int:
+        return max_attempts if max_attempts is not None \
             else self.config.retry.max_attempts
-        task_timeout = float(timeout if timeout is not None
-                             else self.config.default_task_timeout)
+
+    def _task_timeout(self, timeout: float | None) -> float:
+        return float(timeout if timeout is not None
+                     else self.config.default_task_timeout)
+
+    async def submit(
+        self,
+        task_type: str,
+        payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        priority: int = 0,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> Task:
+        # --- 参数校验，失败原因可区分 ---
+        self._check_common_params(task_type, payload, priority,
+                                  max_attempts, timeout)
+
+        payload = payload or {}
+        attempts_cap = self._attempts_cap(max_attempts)
+        task_timeout = self._task_timeout(timeout)
 
         # --- 幂等处理：同键先查既有任务 ---
         if idempotency_key is not None:
@@ -157,6 +182,111 @@ class TaskService:
         )
         return inserted
 
+    # ---------- 流程提交（带依赖编排） ----------
+
+    async def submit_flow(self, specs: list[FlowTaskSpec]) -> FlowStatus:
+        """一次提交一组任务及其依赖关系。
+
+        - 无依赖的任务立即进入 PENDING；有依赖的进入 BLOCKED，
+          不可被调度领取，也不占并发名额；
+        - 全部任务与依赖边在一个事务内落库，要么全成要么全不成；
+        - 校验失败（空流程/key 重复/依赖未知 key/成环/类型未注册）
+          抛 ValidationError，不产生任何数据。
+        """
+        if not specs:
+            raise ValidationError("flow must contain at least one task")
+
+        keys: set[str] = set()
+        deps_by_key: dict[str, list[str]] = {}
+        for spec in specs:
+            if not isinstance(spec.key, str) or not spec.key:
+                raise ValidationError("flow task key must be a non-empty string")
+            if spec.key in keys:
+                raise ValidationError(f"duplicate flow task key: {spec.key}")
+            keys.add(spec.key)
+            self._check_common_params(
+                spec.task_type, spec.payload, spec.priority,
+                spec.max_attempts, spec.timeout,
+            )
+            deps = list(spec.depends_on or [])
+            if len(set(deps)) != len(deps):
+                raise ValidationError(
+                    f"duplicate dependencies in flow task: {spec.key}")
+            if spec.key in deps:
+                raise ValidationError(
+                    f"flow task cannot depend on itself: {spec.key}")
+            deps_by_key[spec.key] = deps
+
+        for spec in specs:
+            for dep in deps_by_key[spec.key]:
+                if dep not in keys:
+                    raise ValidationError(
+                        f"flow task {spec.key} depends on unknown key: {dep}")
+
+        self._check_acyclic(deps_by_key)
+
+        now = time.time()
+        flow_id = uuid.uuid4().hex
+        key_to_id = {key: uuid.uuid4().hex for key in keys}
+
+        tasks: list[Task] = []
+        edges: list[tuple[str, str]] = []
+        for spec in specs:
+            deps = deps_by_key[spec.key]
+            tasks.append(Task(
+                id=key_to_id[spec.key],
+                task_type=spec.task_type,
+                payload=spec.payload or {},
+                idempotency_key=spec.idempotency_key,
+                state=TaskState.BLOCKED if deps else TaskState.PENDING,
+                priority=spec.priority,
+                attempts=0,
+                max_attempts=self._attempts_cap(spec.max_attempts),
+                timeout=self._task_timeout(spec.timeout),
+                not_before=now,
+                created_at=now,
+                updated_at=now,
+                flow_id=flow_id,
+                flow_key=spec.key,
+            ))
+            for dep in deps:
+                edges.append((key_to_id[spec.key], key_to_id[dep]))
+
+        try:
+            await self._thread(self.store.insert_flow, tasks, edges)
+        except IdempotencyKeyTaken as exc:
+            raise IdempotencyConflictError(
+                exc.idempotency_key or "<unknown>") from exc
+
+        self.logger.info(
+            "flow accepted",
+            extra={"task_id": "-", "attempts": "-",
+                   "decision": f"FLOW_ACCEPTED flow={flow_id} "
+                               f"tasks={len(tasks)} edges={len(edges)}"},
+        )
+        return FlowStatus(flow_id=flow_id, state=FlowState.RUNNING, tasks=tasks)
+
+    @staticmethod
+    def _check_acyclic(deps_by_key: dict[str, list[str]]) -> None:
+        """DFS 检测依赖环；发现环抛 ValidationError。"""
+        done: set[str] = set()
+        visiting: set[str] = set()
+
+        def visit(key: str) -> None:
+            if key in done:
+                return
+            if key in visiting:
+                raise ValidationError(
+                    f"dependency cycle detected involving: {key}")
+            visiting.add(key)
+            for up in deps_by_key[key]:
+                visit(up)
+            visiting.discard(key)
+            done.add(key)
+
+        for key in deps_by_key:
+            visit(key)
+
     # ---------- 查询 ----------
 
     async def get_task(self, task_id: str) -> Task:
@@ -170,6 +300,43 @@ class TaskService:
         if task is None:
             raise UnknownTaskError(key)
         return task
+
+    async def get_flow(self, flow_id: str) -> FlowStatus:
+        """查询整条流程的整体状态与每个成员任务的明细。"""
+        tasks = await self._thread(self.store.get_flow_tasks, flow_id)
+        if not tasks:
+            raise UnknownFlowError(flow_id)
+        return FlowStatus(
+            flow_id=flow_id, state=self._derive_flow_state(tasks), tasks=tasks
+        )
+
+    @staticmethod
+    def _derive_flow_state(tasks: list[Task]) -> FlowState:
+        states = {t.state for t in tasks}
+        # 还有任务未终结：流程仍在推进，不能提前算成结束
+        if states - TERMINAL_STATES:
+            return FlowState.RUNNING
+        if states == {TaskState.SUCCEEDED}:
+            return FlowState.SUCCEEDED
+        if states & {TaskState.FAILED, TaskState.DEAD_LETTER}:
+            return FlowState.FAILED
+        if TaskState.CANCELLED in states:
+            return FlowState.CANCELLED
+        # 全部 SKIPPED 却不能溯源到失败/取消上游的情形不应出现；
+        # 保守归为 FAILED，绝不把未执行的流程算成成功
+        return FlowState.FAILED
+
+    async def _propagate(self, task_id: str) -> None:
+        """任务进入终态后带动下游（放行或带停），并记录判定日志。"""
+        decisions = await self._thread(
+            self.store.propagate_from, task_id, time.time()
+        )
+        for tid, decision in decisions:
+            self.logger.info(
+                "flow dependency propagated",
+                extra={"task_id": tid, "attempts": "-",
+                       "decision": f"FLOW_{decision}"},
+            )
 
     # ---------- 取消 ----------
 
@@ -201,6 +368,8 @@ class TaskService:
                     extra={"task_id": task_id, "attempts": task.attempts,
                            "decision": "CANCELLED"},
                 )
+                # 取消成功即进入终态：带动其下游（带停）
+                await self._propagate(task_id)
                 return await self.get_task(task_id)
 
         # RUNNING：通知 worker 取消，由执行协程落 CANCELLED

@@ -135,3 +135,64 @@ def test_get_by_idempotency_key(client):
     assert r.status_code == 200
     assert r.json()["idempotency_key"] == "lookme"
     assert client.get("/tasks/by-idempotency-key/nope").status_code == 404
+
+
+# ---------- 流程（依赖编排）端点 ----------
+
+
+def _poll_flow(client, flow_id, expect, tries=200):
+    for _ in range(tries):
+        g = client.get(f"/flows/{flow_id}").json()
+        if g["state"] in expect:
+            return g
+        time.sleep(0.01)
+    return g
+
+
+def test_flow_submit_and_progress_via_api(client):
+    r = client.post("/flows", json={"tasks": [
+        {"key": "a", "task_type": "echo", "payload": {"x": 1}},
+        {"key": "b", "task_type": "echo", "depends_on": ["a"]},
+    ]})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["total"] == 2
+    assert body["state"] == "RUNNING"
+    states = {t["flow_key"]: t["state"] for t in body["tasks"]}
+    assert states == {"a": "PENDING", "b": "BLOCKED"}
+
+    done = _poll_flow(client, body["flow_id"], ["SUCCEEDED"])
+    assert done["counts"].get("SUCCEEDED") == 2
+    for t in done["tasks"]:
+        assert t["state"] == "SUCCEEDED"
+        assert t["attempts"] == 1
+        assert t["flow_id"] == body["flow_id"]
+
+
+def test_flow_upstream_failure_visible_via_api(client):
+    r = client.post("/flows", json={"tasks": [
+        {"key": "a", "task_type": "always_fail", "max_attempts": 1},
+        {"key": "b", "task_type": "echo", "depends_on": ["a"]},
+    ]})
+    flow_id = r.json()["flow_id"]
+    done = _poll_flow(client, flow_id, ["FAILED"])
+    t = {x["flow_key"]: x for x in done["tasks"]}
+    assert t["a"]["state"] == "DEAD_LETTER"
+    assert t["b"]["state"] == "SKIPPED"
+    assert t["b"]["error_kind"] == "UPSTREAM_DEAD_LETTER"
+    assert t["b"]["blocked_by"] == t["a"]["id"]
+
+
+def test_flow_validation_error_400(client):
+    r = client.post("/flows", json={"tasks": [
+        {"key": "a", "task_type": "echo", "depends_on": ["b"]},
+        {"key": "b", "task_type": "echo", "depends_on": ["a"]},
+    ]})
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "validation_error"
+
+
+def test_unknown_flow_404(client):
+    r = client.get("/flows/no-such-flow")
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "unknown_flow"

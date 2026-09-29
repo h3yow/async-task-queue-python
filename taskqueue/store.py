@@ -16,7 +16,12 @@ import time
 import uuid
 from typing import Any
 
-from taskqueue.models import TERMINAL_STATES, Task, TaskState
+from taskqueue.models import (
+    TERMINAL_STATES,
+    UPSTREAM_FAILURE_STATES,
+    Task,
+    TaskState,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -38,16 +43,39 @@ CREATE TABLE IF NOT EXISTS tasks (
     started_at       REAL,
     finished_at      REAL,
     lease_owner      TEXT,
-    lease_expires_at REAL
+    lease_expires_at REAL,
+    flow_id          TEXT,
+    flow_key         TEXT,
+    blocked_by       TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem
     ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_due
     ON tasks(state, not_before, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_flow
+    ON tasks(flow_id);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id    TEXT NOT NULL,
+    depends_on TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on)
+);
+CREATE INDEX IF NOT EXISTS idx_deps_upstream
+    ON task_dependencies(depends_on);
 """
+
+#: 旧库缺列时按名补齐（轻量迁移）
+_TASK_COLUMN_MIGRATIONS = (
+    ("flow_id", "ALTER TABLE tasks ADD COLUMN flow_id TEXT"),
+    ("flow_key", "ALTER TABLE tasks ADD COLUMN flow_key TEXT"),
+    ("blocked_by", "ALTER TABLE tasks ADD COLUMN blocked_by TEXT"),
+)
 
 # 允许被调度器领取的状态
 _CLAIMABLE_STATES = (TaskState.PENDING.value, TaskState.RETRY_WAIT.value)
+
+#: UPSTREAM_FAILURE_STATES 的字符串形式，供 SQL 层比较
+_UPSTREAM_FAILURE_VALUES = frozenset(s.value for s in UPSTREAM_FAILURE_STATES)
 
 # update_state 时不可由调用方直接覆写的内部字段
 _RESERVED_COLUMNS = {"id", "state"}
@@ -72,6 +100,9 @@ _TASK_COLUMNS = [
     "finished_at",
     "lease_owner",
     "lease_expires_at",
+    "flow_id",
+    "flow_key",
+    "blocked_by",
 ]
 
 
@@ -96,6 +127,17 @@ class TaskStore:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.executescript(_SCHEMA)
         self._conn = conn
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """为旧版本创建的库补齐新增列（幂等）。"""
+        cols = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(tasks)")
+        }
+        for name, ddl in _TASK_COLUMN_MIGRATIONS:
+            if name not in cols:
+                self.connection.execute(ddl)
 
     def close(self) -> None:
         if self._conn is not None:
@@ -136,6 +178,9 @@ class TaskStore:
             "finished_at": task.finished_at,
             "lease_owner": task.lease_owner,
             "lease_expires_at": task.lease_expires_at,
+            "flow_id": task.flow_id,
+            "flow_key": task.flow_key,
+            "blocked_by": task.blocked_by,
         }
 
     @staticmethod
@@ -164,6 +209,9 @@ class TaskStore:
             finished_at=row["finished_at"],
             lease_owner=row["lease_owner"],
             lease_expires_at=row["lease_expires_at"],
+            flow_id=row["flow_id"],
+            flow_key=row["flow_key"],
+            blocked_by=row["blocked_by"],
         )
 
     # ---------- 读 ----------
@@ -227,6 +275,165 @@ class TaskStore:
         except sqlite3.IntegrityError as exc:
             raise IdempotencyKeyTaken(task.idempotency_key) from exc
         return task
+
+    # ---------- 流程（依赖编排） ----------
+
+    def insert_flow(self, tasks: list[Task], deps: list[tuple[str, str]]) -> None:
+        """单事务写入一整条流程：全部任务 + 依赖边，要么全成要么全不成。"""
+        with self._transaction():
+            for task in tasks:
+                row = self._task_to_row(task)
+                cols = ", ".join(row.keys())
+                marks = ", ".join("?" for _ in row)
+                try:
+                    self.connection.execute(
+                        f"INSERT INTO tasks ({cols}) VALUES ({marks})",
+                        tuple(row.values()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise IdempotencyKeyTaken(task.idempotency_key) from exc
+            for task_id, depends_on in deps:
+                self.connection.execute(
+                    "INSERT INTO task_dependencies (task_id, depends_on) "
+                    "VALUES (?, ?)",
+                    (task_id, depends_on),
+                )
+
+    def get_dependencies(self, task_id: str) -> list[str]:
+        """该任务依赖的上游任务 id 列表（顺序确定）。"""
+        rows = self.connection.execute(
+            "SELECT depends_on FROM task_dependencies WHERE task_id = ? "
+            "ORDER BY depends_on",
+            (task_id,),
+        ).fetchall()
+        return [r["depends_on"] for r in rows]
+
+    def get_dependents(self, task_id: str) -> list[str]:
+        """依赖该任务的下游任务 id 列表（顺序确定）。"""
+        rows = self.connection.execute(
+            "SELECT task_id FROM task_dependencies WHERE depends_on = ? "
+            "ORDER BY task_id",
+            (task_id,),
+        ).fetchall()
+        return [r["task_id"] for r in rows]
+
+    def get_flow_tasks(self, flow_id: str) -> list[Task]:
+        rows = self.connection.execute(
+            f"SELECT {', '.join(_TASK_COLUMNS)} FROM tasks "
+            "WHERE flow_id = ? ORDER BY created_at, flow_key",
+            (flow_id,),
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    def _evaluate_blocked(
+        self, task_id: str, now: float, decisions: list[tuple[str, str]]
+    ) -> bool:
+        """在事务内评估一个 BLOCKED 任务：上游全成功则放行，任一失败则带停。
+
+        返回是否发生了状态变更。判定只读取上游的终态事实，状态守卫
+        ``WHERE state = 'BLOCKED'`` 保证同一任务不会被重复判定。
+        """
+        row = self.connection.execute(
+            "SELECT state FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["state"] != TaskState.BLOCKED.value:
+            return False
+
+        upstreams = self.get_dependencies(task_id)
+        upstream_states: dict[str, str] = {}
+        for up in upstreams:
+            up_row = self.connection.execute(
+                "SELECT state FROM tasks WHERE id = ?", (up,)
+            ).fetchone()
+            # 上游记录缺失视为异常，保守地继续等待（不放行也不带停）
+            if up_row is None:
+                return False
+            upstream_states[up] = up_row["state"]
+
+        # 任一上游未成功终止 -> 带停（按 id 顺序取第一个，判定确定）
+        for up in upstreams:
+            state = upstream_states[up]
+            if state in _UPSTREAM_FAILURE_VALUES:
+                reason = f"UPSTREAM_{state}"
+                changed = self.connection.execute(
+                    "UPDATE tasks SET state = ?, blocked_by = ?, "
+                    "last_error = ?, error_kind = ?, "
+                    "updated_at = ?, finished_at = ? "
+                    "WHERE id = ? AND state = ?",
+                    (
+                        TaskState.SKIPPED.value,
+                        up,
+                        f"skipped: upstream task {up} terminated as {state}",
+                        reason,
+                        now,
+                        now,
+                        task_id,
+                        TaskState.BLOCKED.value,
+                    ),
+                ).rowcount == 1
+                if changed:
+                    decisions.append((task_id, f"SKIPPED by {up} ({state})"))
+                return changed
+
+        # 全部上游成功 -> 放行进入待调度
+        if all(s == TaskState.SUCCEEDED.value for s in upstream_states.values()):
+            changed = self.connection.execute(
+                "UPDATE tasks SET state = ?, not_before = ?, updated_at = ? "
+                "WHERE id = ? AND state = ?",
+                (
+                    TaskState.PENDING.value,
+                    now,
+                    now,
+                    task_id,
+                    TaskState.BLOCKED.value,
+                ),
+            ).rowcount == 1
+            if changed:
+                decisions.append((task_id, "UNBLOCKED"))
+            return changed
+
+        # 仍有上游未终结：继续等待，不占并发名额
+        return False
+
+    def propagate_from(self, task_id: str, now: float) -> list[tuple[str, str]]:
+        """某任务进入终态后，沿依赖边向下游传播（单事务、可级联）。
+
+        返回 ``(task_id, decision)`` 列表供调用方记日志。幂等：
+        对同一上游结果重复传播不会得到不同结论。
+        """
+        decisions: list[tuple[str, str]] = []
+        with self._transaction():
+            queue = list(self.get_dependents(task_id))
+            seen: set[str] = set()
+            while queue:
+                tid = queue.pop(0)
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                if self._evaluate_blocked(tid, now, decisions):
+                    queue.extend(self.get_dependents(tid))
+        return decisions
+
+    def refresh_blocked(self, now: float) -> list[tuple[str, str]]:
+        """启动恢复：重新评估所有 BLOCKED 任务。
+
+        进程可能在上游落终态之后、传播之前崩溃，导致下游卡在 BLOCKED；
+        这里做全量扫描并循环到不再变化（级联带停也能收敛）。
+        """
+        decisions: list[tuple[str, str]] = []
+        with self._transaction():
+            while True:
+                rows = self.connection.execute(
+                    "SELECT id FROM tasks WHERE state = ? ORDER BY created_at",
+                    (TaskState.BLOCKED.value,),
+                ).fetchall()
+                progress = False
+                for r in rows:
+                    if self._evaluate_blocked(r["id"], now, decisions):
+                        progress = True
+                if not progress:
+                    break
+        return decisions
 
     def claim_next_due(self, owner: str, now: float, lease_seconds: float) -> Task | None:
         """原子领取一条到期可执行任务（优先级高者优先，同优先级 FIFO）。

@@ -6,26 +6,29 @@
 - 幂等提交：同一幂等键重复提交不会产生重复执行；
 - 有界并发 + 优先级调度：慢任务不阻塞其他任务，取消/超时及时释放资源；
 - 失败重试与死信：可重试错误按指数退避重试，超次数进入死信并可查询原因与尝试次数；
-- 崩溃恢复：进程重启后未完成任务不丢失、不重复执行，执行中断的任务不会被静默标记成功。
+- 依赖与流程编排：一次提交一组任务及其先后依赖，上游成功后下游自动放行，
+  上游失败/取消/死信时下游被带停到明确的终态并可追溯原因；
+- 崩溃恢复：进程重启后未完成任务不丢失、不重复执行，执行中断的任务不会被静默标记成功，
+  流程也不会卡住——已成功的上游不重跑，未完成的依赖关系继续推进。
 
 ## 目录结构
 
 ```
 taskqueue/
   config.py         运行/重试配置
-  models.py         Task 领域模型与任务状态枚举
-  errors.py         可区分的失败原因（未知任务/非法状态/幂等冲突/可重试/不可重试…）
+  models.py         Task 领域模型、任务状态枚举、流程视图（FlowStatus/FlowTaskSpec）
+  errors.py         可区分的失败原因（未知任务/未知流程/非法状态/幂等冲突/可重试…）
   dbutil.py         单线程 DB actor：所有 SQLite 阻塞调用的唯一执行通道
-  store.py          SQLite 持久化（原子领取、乐观状态更新、启动恢复）
+  store.py          SQLite 持久化（原子领取、乐观状态更新、依赖边、下游传播、启动恢复）
   retry.py          指数退避重试策略
   registry.py       任务处理器注册表与执行上下文（取消信号）
-  worker.py         调度与执行循环（并发上限、超时、取消、重试、死信、日志）
-  service.py        对外协调层：提交 / 查询 / 幂等去重 / 取消
-  api.py            FastAPI 路由与错误码映射
+  worker.py         调度与执行循环（并发上限、超时、取消、重试、死信、终态传播、日志）
+  service.py        对外协调层：提交 / 流程提交 / 查询 / 幂等去重 / 取消
+  api.py            FastAPI 路由与错误码映射（/tasks 与 /flows）
   app.py            应用组装与 lifespan 生命周期
   logging_setup.py  统一日志（task_id / attempts / decision）
 main.py             ASGI 入口：app = create_app()
-tests/              30 个测试，覆盖核心场景
+tests/              48 个测试，覆盖核心场景
 ```
 
 ## 任务状态机
@@ -49,9 +52,11 @@ tests/              30 个测试，覆盖核心场景
 ```
 
 - **PENDING**：已落库等待调度（含重启后退回的孤儿）。
+- **BLOCKED**：流程内等待上游依赖；**不可被调度领取，不占并发名额**。
 - **RETRY_WAIT**：可重试失败后等待退避，`not_before` 到期前不会被领取。
 - **RUNNING**：已被某个 worker 领取，带租约 `lease_owner / lease_expires_at`。
-- **SUCCEEDED / FAILED / CANCELLED / DEAD_LETTER**：四类终态，不再被调度。
+- **SUCCEEDED / FAILED / CANCELLED / DEAD_LETTER / SKIPPED**：五类终态，不再被调度。
+  `SKIPPED` 表示因上游未成功而被带停，**从未执行，也不算成功**。
 
 合法转换之外的操作一律拒绝：
 - 查询/取消**未知任务** → `unknown_task`（404）；
@@ -83,6 +88,75 @@ tests/              30 个测试，覆盖核心场景
   **不影响后续任务**。取消为协作式：处理器可通过
   `ExecutionContext.cancel_event` 感知并提前退出。
 
+## 依赖与流程编排
+
+一组有先后关系的任务可以作为一条**流程（flow）**一次提交：
+
+```bash
+curl -s -X POST localhost:8000/flows -H 'content-type: application/json' -d '{
+  "tasks": [
+    {"key": "extract",  "task_type": "etl_extract"},
+    {"key": "transform","task_type": "etl_transform", "depends_on": ["extract"]},
+    {"key": "load",     "task_type": "etl_load",      "depends_on": ["transform"]}
+  ]
+}'
+```
+
+- 每个任务用流程内唯一的 `key` 命名，`depends_on` 按 key 引用上游；
+  支持扇入/扇出（菱形依赖）。提交时校验：空流程、重复 key、依赖未知 key、
+  自依赖、**依赖环**、未注册的 `task_type` 一律以 `validation_error`（400）拒绝，
+  且**不会产生任何数据**。
+- 全部任务与依赖边在**一个事务**内落库：无依赖的任务直接 `PENDING`，
+  有依赖的进入 `BLOCKED`。`BLOCKED` 不会被调度器领取，也**不占并发名额**，
+  因此同一条流程里其他可运行的任务（以及无关的普通任务）不会被堵住。
+- 上游进入终态后确定性地带动下游（同一事务内沿依赖边级联传播）：
+  - 全部上游 `SUCCEEDED` → 下游放行（`BLOCKED → PENDING`），按正常调度执行；
+  - 任一上游 `FAILED / CANCELLED / DEAD_LETTER / SKIPPED` → 下游落 `SKIPPED` 终态，
+    并记录 `blocked_by`（带停它的上游任务 id）与可区分的 `error_kind`：
+    `UPSTREAM_FAILED / UPSTREAM_CANCELLED / UPSTREAM_DEAD_LETTER / UPSTREAM_SKIPPED`。
+    被跳过的任务会进一步级联带停它自己的下游。
+- 判定只读取上游已落库的终态事实，且状态更新带 `state='BLOCKED'` 守卫：
+  同一个上游的结果不会被一边当成功一边当失败，下游不会时跑时不跑。
+- `BLOCKED` 中的任务也可以被直接取消（走 `POST /tasks/{id}/cancel`，
+  与排队中任务相同的语义）。
+
+### 流程进度查询
+
+```bash
+curl -s localhost:8000/flows/<flow_id>
+```
+
+返回整体状态与每个成员任务的明细（`state / attempts / error_kind /
+last_error / blocked_by / finished_at` 等）。整体状态由成员任务推导：
+
+| 整体状态 | 条件 |
+| --- | --- |
+| `RUNNING` | 还有任务未进入终态 |
+| `SUCCEEDED` | 全部任务 `SUCCEEDED` |
+| `FAILED` | 存在 `FAILED` 或 `DEAD_LETTER` 任务 |
+| `CANCELLED` | 全部终结，无失败，但存在 `CANCELLED` 任务 |
+
+### 重启后的流程恢复
+
+- 流程不丢：任务与依赖边都持久化在 SQLite，重启后原样可见；
+- 不卡住：worker 启动时除了恢复孤儿 `RUNNING` 任务，还会**全量重新评估所有
+  `BLOCKED` 任务**——若上次进程崩溃在“上游落终态”与“传播到下游”之间，
+  重启后补做传播（放行或带停），级联也能收敛；
+- 不重复：已 `SUCCEEDED` 的上游永不重跑；执行中崩溃的上游按孤儿恢复重跑
+  （崩溃那次不计入真实执行次数），成功后下游继续推进。
+
+### 与单任务模式的兼容范围
+
+- 不带依赖的普通任务：**行为完全不变**，`POST /tasks` 的入参、返回与状态机
+  都不受影响（回归由既有测试套件保证）；
+- 流程内任务与普通任务共享同一调度器、并发上限、重试/死信/取消语义，
+  可以混跑互不影响；
+- 流程内任务同样支持 `idempotency_key / priority / max_attempts / timeout`，
+  语义与单任务一致；流程提交本身是整体校验、整体落库，
+  目前**没有流程级幂等键**——调用方如需防重，可为成员任务指定幂等键；
+- 跨流程依赖（`depends_on` 引用另一条流程的任务）暂不支持，
+  依赖只能引用同一次提交内的 key。
+
 ## 持久化与崩溃恢复语义
 
 - 存储为 SQLite（WAL），关键不变量：
@@ -108,12 +182,14 @@ tests/              30 个测试，覆盖核心场景
 | POST | `/tasks` | 提交任务（201），body：`task_type, payload, idempotency_key?, priority?, max_attempts?, timeout?` |
 | GET  | `/tasks/{id}` | 查询任务状态/结果/错误 |
 | GET  | `/tasks/by-idempotency-key/{key}` | 按幂等键查询 |
-| POST | `/tasks/{id}/cancel` | 取消排队中（直接 CANCELLED）或运行中（协作取消）任务 |
+| POST | `/tasks/{id}/cancel` | 取消排队中/阻塞中（直接 CANCELLED）或运行中（协作取消）任务 |
+| POST | `/flows` | 提交流程（201），body：`tasks: [{key, task_type, payload?, depends_on?, ...}]` |
+| GET  | `/flows/{flow_id}` | 查询流程整体状态与成员任务明细 |
 | GET  | `/health` | 健康检查 |
 
 错误响应体统一为 `{"detail": {"error": "<code>", "message": ..., ...}}`，
-`error` 取值：`unknown_task` / `invalid_state` / `idempotency_conflict` /
-`validation_error`（请求体字段级校验为 422）。
+`error` 取值：`unknown_task` / `unknown_flow` / `invalid_state` /
+`idempotency_conflict` / `validation_error`（请求体字段级校验为 422）。
 
 ### 处理器示例
 
@@ -153,7 +229,7 @@ async def long_job(payload, ctx):
 # 安装依赖（含 pytest / httpx / ruff）
 uv sync
 
-# 运行全部测试（30 个，含并发幂等、重试成功、死信、重启恢复等）
+# 运行全部测试（48 个，含并发幂等、重试成功、死信、流程编排、重启恢复等）
 uv run pytest -q
 
 # 静态检查
@@ -169,6 +245,14 @@ curl -s -X POST localhost:8000/tasks \
 
 # 查询
 curl -s localhost:8000/tasks/<task_id>
+
+# 提交一条三步流程并查询整体进度
+curl -s -X POST localhost:8000/flows -H 'content-type: application/json' -d '{
+  "tasks": [
+    {"key": "a", "task_type": "flaky"},
+    {"key": "b", "task_type": "flaky", "depends_on": ["a"]}
+  ]}'
+curl -s localhost:8000/flows/<flow_id>
 ```
 
 关键测试与需求对应关系：
@@ -182,6 +266,11 @@ curl -s localhost:8000/tasks/<task_id>
 | 不可重试立即失败 | `test_non_retryable_fails_immediately` |
 | 重启恢复 / 不静默成功 / 不重复执行 | `tests/test_recovery.py` |
 | 并发上限 / 优先级 / 超时释放 | `tests/test_scheduling.py` |
+| 依赖满足才执行 / BLOCKED 不占并发名额 | `tests/test_flows.py::test_flow_executes_in_dependency_order` / `test_blocked_task_does_not_hold_concurrency_slot` |
+| 上游失败/死信/取消带停下游且原因可区分 | `test_upstream_failure_skips_downstream_with_reason` / `test_upstream_dead_letter_skips_downstream` / `test_upstream_cancelled_while_running_skips_downstream` |
+| 流程进度视图 | `test_flow_progress_view_mid_flight` |
+| 重启后流程继续推进、已成功上游不重跑 | `test_restart_continues_flow_without_rerunning_succeeded` / `test_restart_skips_downstream_of_failed_upstream` / `test_restart_recovers_running_upstream_and_continues` |
+| 流程 API 端到端 | `tests/test_api.py::test_flow_submit_and_progress_via_api` 等 |
 
 ## 日志
 
@@ -197,4 +286,6 @@ curl -s localhost:8000/tasks/<task_id>
 
 `decision` 取值包括：`ACCEPTED / IDEMPOTENT_REPLAY / RUN / SUCCEEDED /
 RETRY in <delay>s / DEAD_LETTER / FAILED_NON_RETRYABLE / CANCELLED /
-CANCEL_REQUESTED / RECOVER / SUCCESS_REJECTED / SHUTDOWN` 等。
+CANCEL_REQUESTED / RECOVER / SUCCESS_REJECTED / SHUTDOWN /
+FLOW_ACCEPTED / FLOW_UNBLOCKED / FLOW_SKIPPED by <upstream> (<state>) /
+FLOW_RECOVER ...` 等。
