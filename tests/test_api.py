@@ -27,9 +27,14 @@ def client(tmp_path):
     async def always_fail(payload, ctx):
         raise RetryableTaskError("api boom")
 
+    async def hard_fail(payload, ctx):
+        from taskqueue.errors import NonRetryableTaskError
+        raise NonRetryableTaskError("api hard boom")
+
     def configure(registry):
         registry.register("echo", echo)
         registry.register("always_fail", always_fail)
+        registry.register("hard_fail", hard_fail)
 
     import logging
     log = logging.getLogger("taskqueue.api-test")
@@ -135,3 +140,76 @@ def test_get_by_idempotency_key(client):
     assert r.status_code == 200
     assert r.json()["idempotency_key"] == "lookme"
     assert client.get("/tasks/by-idempotency-key/nope").status_code == 404
+
+
+# ---------- 流程接口 ----------
+
+
+def _poll_workflow(client, wf_id, expect, tries=300):
+    for _ in range(tries):
+        body = client.get(f"/workflows/{wf_id}").json()
+        if body["state"] in expect:
+            return body
+        time.sleep(0.01)
+    return body
+
+
+def test_workflow_submit_and_progress_success(client):
+    r = client.post("/workflows", json={
+        "name": "demo-chain",
+        "tasks": [
+            {"key": "a", "task_type": "echo", "payload": {"i": 1}},
+            {"key": "b", "task_type": "echo", "depends_on": ["a"],
+             "payload": {"i": 2}},
+        ],
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["id"]
+    assert body["name"] == "demo-chain"
+    wf_id = body["id"]
+
+    done = _poll_workflow(client, wf_id, ["SUCCEEDED"])
+    assert done["state"] == "SUCCEEDED"
+    assert done["state_counts"] == {"SUCCEEDED": 2}
+    by_key = {t["key"]: t for t in done["tasks"]}
+    assert by_key["b"]["depends_on"] == ["a"]
+    assert by_key["b"]["task"]["state"] == "SUCCEEDED"
+    assert by_key["a"]["task"]["workflow_id"] == wf_id
+
+
+def test_workflow_failure_marks_downstream_skipped(client):
+    r = client.post("/workflows", json={
+        "tasks": [
+            {"key": "root", "task_type": "hard_fail"},
+            {"key": "child", "task_type": "echo", "depends_on": ["root"]},
+            {"key": "grand", "task_type": "echo", "depends_on": ["child"]},
+        ],
+    })
+    wf_id = r.json()["id"]
+    done = _poll_workflow(client, wf_id, ["FAILED"])
+    assert done["state"] == "FAILED"
+    by_key = {t["key"]: t for t in done["tasks"]}
+    assert by_key["root"]["task"]["state"] == "FAILED"
+    assert by_key["child"]["task"]["state"] == "SKIPPED"
+    assert by_key["grand"]["task"]["state"] == "SKIPPED"
+    assert by_key["child"]["skipped_by_key"] == "root"
+    assert by_key["grand"]["skipped_by_key"] == "child"
+    assert by_key["child"]["task"]["error_kind"] == "UPSTREAM_FAILED"
+
+
+def test_workflow_cycle_rejected_400(client):
+    r = client.post("/workflows", json={
+        "tasks": [
+            {"key": "a", "task_type": "echo", "depends_on": ["b"]},
+            {"key": "b", "task_type": "echo", "depends_on": ["a"]},
+        ],
+    })
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"] == "validation_error"
+
+
+def test_unknown_workflow_404(client):
+    r = client.get("/workflows/nope")
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "unknown_workflow"

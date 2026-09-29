@@ -72,6 +72,18 @@ class Worker:
                 "recovered orphaned running task after restart",
                 extra={"task_id": tid, "attempts": "-", "decision": "RECOVER"},
             )
+        # 流程对账：修复崩溃窗口中“上游已结算、下游未传播”的流程；
+        # 激活依赖已满足的 BLOCKED，带停上游已非成功终结的未开始任务。
+        reconciled = await run_db(self.store.reconcile_workflows, time.time())
+        for wf_id, settlement in reconciled.items():
+            if settlement.activated or settlement.skipped:
+                self.logger.warning(
+                    "reconciled workflow after restart",
+                    extra={"task_id": wf_id, "attempts": "-",
+                           "decision": f"WORKFLOW_RECONCILE "
+                                       f"activated={len(settlement.activated)} "
+                                       f"skipped={len(settlement.skipped)}"},
+                )
         self._stop.clear()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="worker-poll")
         self.logger.info(
@@ -264,12 +276,20 @@ class Worker:
         await self._mark_succeeded(task, result)
 
     async def _mark_succeeded(self, task: Task, result: object) -> None:
-        ok = await self._update(task, TaskState.SUCCEEDED, result=result)
-        if ok:
+        settlement = await run_db(
+            self.store.settle_terminal,
+            task.id,
+            TaskState.RUNNING,
+            TaskState.SUCCEEDED,
+            time.time(),
+            result=result,
+        )
+        if settlement.changed:
             self.logger.info(
                 "task succeeded",
                 extra={"task_id": task.id, "attempts": task.attempts,
-                       "decision": "SUCCEEDED"},
+                       "decision": f"SUCCEEDED activated="
+                                   f"{len(settlement.activated)}"},
             )
         else:
             # 状态已被并发改动（例如取消/恢复），不能静默成功
@@ -283,6 +303,7 @@ class Worker:
     async def _update(
         self, task: Task, new_state: TaskState, **fields: object
     ) -> bool:
+        """非终态的乐观更新（目前仅 RETRY_WAIT 使用）。"""
         return await run_db(
             self.store.update_state,
             task.id,
@@ -291,6 +312,27 @@ class Worker:
             time.time(),
             **fields,
         )
+
+    async def _settle_terminal(
+        self, task: Task, new_state: TaskState, **fields: object
+    ) -> bool:
+        """终态结算：同事务内完成依赖传播，返回状态守卫是否命中。"""
+        settlement = await run_db(
+            self.store.settle_terminal,
+            task.id,
+            TaskState.RUNNING,
+            new_state,
+            time.time(),
+            **fields,
+        )
+        if settlement.skipped:
+            self.logger.warning(
+                "downstream tasks skipped after terminal outcome",
+                extra={"task_id": task.id, "attempts": task.attempts,
+                       "decision": f"DOWNSTREAM_SKIPPED "
+                                   f"count={len(settlement.skipped)}"},
+            )
+        return settlement.changed
 
     async def _settle(
         self,
@@ -306,12 +348,14 @@ class Worker:
         error_fields = {"last_error": error_message, "error_kind": error_kind}
 
         if cancelled:
-            ok = await self._update(task, TaskState.CANCELLED, **error_fields)
+            ok = await self._settle_terminal(
+                task, TaskState.CANCELLED, **error_fields
+            )
             self._log_outcome(task, attempts, "CANCELLED", ok, error_message)
             return
 
         if not retryable:
-            ok = await self._update(task, TaskState.FAILED, **error_fields)
+            ok = await self._settle_terminal(task, TaskState.FAILED, **error_fields)
             self._log_outcome(task, attempts, "FAILED_NON_RETRYABLE", ok,
                               error_message)
             return
@@ -338,7 +382,9 @@ class Worker:
             return
 
         # 重试耗尽 -> 死信
-        ok = await self._update(task, TaskState.DEAD_LETTER, **error_fields)
+        ok = await self._settle_terminal(
+            task, TaskState.DEAD_LETTER, **error_fields
+        )
         self._log_outcome(task, attempts, "DEAD_LETTER", ok, error_message)
 
     def _log_outcome(

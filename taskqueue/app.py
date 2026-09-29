@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from taskqueue.api import router as task_router
+from taskqueue.api import workflow_router
 from taskqueue.config import TaskQueueConfig
 from taskqueue.logging_setup import configure_logging
 from taskqueue.registry import HandlerRegistry
@@ -40,10 +41,6 @@ def create_app(
     service = TaskService(store, registry, RetryPolicy(config.retry),
                           config, logger)
 
-    store = TaskStore(config.db_path)
-    service = TaskService(store, registry, RetryPolicy(config.retry),
-                          config, logger)
-
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await service.start()
@@ -61,4 +58,5 @@ def create_app(
         return {"status": "ok"}
 
     app.include_router(task_router)
+    app.include_router(workflow_router)
     return app

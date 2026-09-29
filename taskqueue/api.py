@@ -17,11 +17,14 @@ from taskqueue.errors import (
     IdempotencyConflictError,
     InvalidStateTransitionError,
     UnknownTaskError,
+    UnknownWorkflowError,
     ValidationError,
 )
 from taskqueue.models import Task, TaskState
+from taskqueue.workflow import WorkflowSpec, WorkflowTaskSpec
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+workflow_router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 
 # ---------- 请求 / 响应模型 ----------
@@ -54,6 +57,9 @@ class TaskResponse(BaseModel):
     updated_at: float
     started_at: float | None
     finished_at: float | None
+    workflow_id: str | None = None
+    task_key: str | None = None
+    skipped_by_task_id: str | None = None
 
     @classmethod
     def from_task(cls, task: Task) -> TaskResponse:
@@ -75,6 +81,64 @@ class TaskResponse(BaseModel):
             updated_at=task.updated_at,
             started_at=task.started_at,
             finished_at=task.finished_at,
+            workflow_id=task.workflow_id,
+            task_key=task.task_key,
+            skipped_by_task_id=task.skipped_by_task_id,
+        )
+
+
+# ---------- 流程请求 / 响应模型 ----------
+
+
+class WorkflowTaskRequest(BaseModel):
+    key: str = Field(..., min_length=1)
+    task_type: str = Field(..., min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    depends_on: list[str] = Field(default_factory=list)
+    idempotency_key: str | None = Field(default=None, max_length=200)
+    priority: int = 0
+    max_attempts: int | None = Field(default=None, ge=1)
+    timeout: float | None = Field(default=None, gt=0)
+
+
+class WorkflowSubmitRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1)
+    tasks: list[WorkflowTaskRequest] = Field(..., min_length=1)
+
+
+class WorkflowTaskItem(BaseModel):
+    key: str | None
+    depends_on: list[str]
+    skipped_by_key: str | None
+    task: TaskResponse
+
+    @classmethod
+    def from_view(cls, view) -> WorkflowTaskItem:
+        return cls(
+            key=view.task.task_key,
+            depends_on=view.depends_on,
+            skipped_by_key=view.skipped_by_key,
+            task=TaskResponse.from_task(view.task),
+        )
+
+
+class WorkflowResponse(BaseModel):
+    id: str
+    name: str | None
+    created_at: float
+    state: str
+    state_counts: dict[str, int]
+    tasks: list[WorkflowTaskItem]
+
+    @classmethod
+    def from_view(cls, view) -> WorkflowResponse:
+        return cls(
+            id=view.workflow.id,
+            name=view.workflow.name,
+            created_at=view.workflow.created_at,
+            state=view.state,
+            state_counts=view.state_counts,
+            tasks=[WorkflowTaskItem.from_view(t) for t in view.tasks],
         )
 
 
@@ -87,6 +151,11 @@ def _raise_domain_error(exc: Exception) -> None:
         raise HTTPException(status_code=404, detail={
             "error": "unknown_task", "message": str(exc),
             "task_id": getattr(exc, "task_id", None),
+        })
+    if isinstance(exc, UnknownWorkflowError):
+        raise HTTPException(status_code=404, detail={
+            "error": "unknown_workflow", "message": str(exc),
+            "workflow_id": getattr(exc, "workflow_id", None),
         })
     if isinstance(exc, InvalidStateTransitionError):
         raise HTTPException(status_code=409, detail={
@@ -159,3 +228,47 @@ async def cancel_task(task_id: str, request: Request) -> TaskResponse:
         _raise_domain_error(exc)
         raise
     return TaskResponse.from_task(task)
+
+
+# ---------- 流程路由 ----------
+
+
+@workflow_router.post("", response_model=WorkflowResponse, status_code=201)
+async def submit_workflow(
+    req: WorkflowSubmitRequest, request: Request
+) -> WorkflowResponse:
+    service = _get_service(request)
+    spec = WorkflowSpec(
+        name=req.name,
+        tasks=[
+            WorkflowTaskSpec(
+                key=item.key,
+                task_type=item.task_type,
+                depends_on=list(item.depends_on),
+                payload=item.payload,
+                idempotency_key=item.idempotency_key,
+                priority=item.priority,
+                max_attempts=item.max_attempts,
+                timeout=item.timeout,
+            )
+            for item in req.tasks
+        ],
+    )
+    try:
+        view = await service.submit_workflow(spec)
+    except (UnknownWorkflowError, IdempotencyConflictError,
+            ValidationError) as exc:
+        _raise_domain_error(exc)
+        raise  # 不可达，仅为类型检查
+    return WorkflowResponse.from_view(view)
+
+
+@workflow_router.get("/{workflow_id}", response_model=WorkflowResponse)
+async def get_workflow(workflow_id: str, request: Request) -> WorkflowResponse:
+    service = _get_service(request)
+    try:
+        view = await service.get_workflow(workflow_id)
+    except UnknownWorkflowError as exc:
+        _raise_domain_error(exc)
+        raise
+    return WorkflowResponse.from_view(view)

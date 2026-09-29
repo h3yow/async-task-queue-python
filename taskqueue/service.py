@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 import uuid
 from typing import Any
@@ -19,16 +20,32 @@ from taskqueue.errors import (
     IdempotencyConflictError,
     InvalidStateTransitionError,
     UnknownTaskError,
+    UnknownWorkflowError,
     ValidationError,
 )
-from taskqueue.models import TERMINAL_STATES, Task, TaskState
+from taskqueue.models import (
+    TERMINAL_STATES,
+    WORKFLOW_FAILED,
+    WORKFLOW_RUNNING,
+    WORKFLOW_SUCCEEDED,
+    Task,
+    TaskState,
+    Workflow,
+    WorkflowTaskView,
+    WorkflowView,
+)
 from taskqueue.registry import HandlerRegistry
 from taskqueue.retry import RetryPolicy
 from taskqueue.store import IdempotencyKeyTaken, TaskStore
 from taskqueue.worker import Worker
+from taskqueue.workflow import WorkflowSpec, validate_workflow_spec
 
-# 取消时可直接落库的“排队中”状态
-_QUEUED_STATES = (TaskState.PENDING, TaskState.RETRY_WAIT)
+# 取消时可直接落库的“排队中/阻塞中”状态
+_QUEUED_STATES = (
+    TaskState.PENDING,
+    TaskState.RETRY_WAIT,
+    TaskState.BLOCKED,
+)
 
 
 class TaskService:
@@ -67,16 +84,15 @@ class TaskService:
 
     # ---------- 提交 ----------
 
-    async def submit(
+    def _validate_task_params(
         self,
         task_type: str,
-        payload: dict[str, Any] | None = None,
-        idempotency_key: str | None = None,
-        priority: int = 0,
-        max_attempts: int | None = None,
-        timeout: float | None = None,
-    ) -> Task:
-        # --- 参数校验，失败原因可区分 ---
+        payload: dict[str, Any] | None,
+        priority: int,
+        max_attempts: int | None,
+        timeout: float | None,
+    ) -> tuple[dict[str, Any], int, float]:
+        """校验并归一化单任务参数，返回 (payload, max_attempts, timeout)。"""
         if not isinstance(task_type, str) or not task_type:
             raise ValidationError("task_type must be a non-empty string")
         if payload is not None and not isinstance(payload, dict):
@@ -98,6 +114,21 @@ class TaskService:
             else self.config.retry.max_attempts
         task_timeout = float(timeout if timeout is not None
                              else self.config.default_task_timeout)
+        return payload, attempts_cap, task_timeout
+
+    async def submit(
+        self,
+        task_type: str,
+        payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        priority: int = 0,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> Task:
+        # --- 参数校验，失败原因可区分 ---
+        payload, attempts_cap, task_timeout = self._validate_task_params(
+            task_type, payload, priority, max_attempts, timeout
+        )
 
         # --- 幂等处理：同键先查既有任务 ---
         if idempotency_key is not None:
@@ -171,6 +202,126 @@ class TaskService:
             raise UnknownTaskError(key)
         return task
 
+    # ---------- 流程提交 / 进度 ----------
+
+    async def submit_workflow(self, spec: WorkflowSpec) -> WorkflowView:
+        """一次提交一组任务及其依赖，返回流程初始进度视图。
+
+        - 无依赖任务以 PENDING 落库，可立即被调度；
+        - 有依赖任务以 BLOCKED 落库，不参与领取、不占并发名额；
+        - 结构性错误（重复 key / 未知依赖 / 环）与未知处理器类型一律拒绝；
+        - 任一任务幂等键与库中既有任务冲突，整批回滚（不落任何任务）。
+        """
+        validate_workflow_spec(spec)
+        if spec.name is not None and (
+            not isinstance(spec.name, str) or not spec.name
+        ):
+            raise ValidationError("workflow name must be a non-empty string")
+
+        now = time.time()
+        workflow_id = uuid.uuid4().hex
+        tasks: list[Task] = []
+        dependencies: list[tuple[str, str]] = []
+        idem_keys: set[str] = set()
+
+        for item in spec.tasks:
+            payload, attempts_cap, task_timeout = self._validate_task_params(
+                item.task_type, item.payload, item.priority,
+                item.max_attempts, item.timeout,
+            )
+            if item.idempotency_key is not None:
+                if item.idempotency_key in idem_keys:
+                    raise ValidationError(
+                        f"duplicate idempotency_key within workflow: "
+                        f"{item.idempotency_key}"
+                    )
+                idem_keys.add(item.idempotency_key)
+
+            has_deps = len(item.depends_on) > 0
+            tasks.append(Task(
+                id=uuid.uuid4().hex,
+                task_type=item.task_type,
+                payload=payload,
+                idempotency_key=item.idempotency_key,
+                state=TaskState.BLOCKED if has_deps else TaskState.PENDING,
+                priority=item.priority,
+                attempts=0,
+                max_attempts=attempts_cap,
+                timeout=task_timeout,
+                not_before=now,
+                created_at=now,
+                updated_at=now,
+                workflow_id=workflow_id,
+                task_key=item.key,
+            ))
+            for dep in item.depends_on:
+                dependencies.append((item.key, dep))
+
+        workflow = Workflow(id=workflow_id, name=spec.name, created_at=now)
+        try:
+            await self._thread(
+                self.store.insert_workflow, workflow, tasks, dependencies
+            )
+        except sqlite3.IntegrityError:
+            # 主要是幂等键与库中既有任务冲突：整批回滚，按冲突拒绝
+            raise IdempotencyConflictError(
+                next((t.id for t in tasks), workflow_id)
+            ) from None
+
+        self.logger.info(
+            "workflow accepted",
+            extra={"task_id": workflow_id, "attempts": len(tasks),
+                   "decision": f"WORKFLOW_ACCEPTED tasks={len(tasks)} "
+                               f"edges={len(dependencies)}"},
+        )
+        return await self.get_workflow(workflow_id)
+
+    async def get_workflow(self, workflow_id: str) -> WorkflowView:
+        workflow = await self._thread(self.store.get_workflow, workflow_id)
+        if workflow is None:
+            raise UnknownWorkflowError(workflow_id)
+        tasks = await self._thread(self.store.list_workflow_tasks, workflow_id)
+        deps = await self._thread(
+            self.store.list_workflow_dependencies, workflow_id
+        )
+
+        depends_map: dict[str, list[str]] = {}
+        for task_key, dep_key in deps:
+            depends_map.setdefault(task_key, []).append(dep_key)
+
+        key_by_id = {t.id: t.task_key for t in tasks}
+        views: list[WorkflowTaskView] = []
+        state_counts: dict[str, int] = {}
+        for task in tasks:
+            state_counts[task.state.value] = \
+                state_counts.get(task.state.value, 0) + 1
+            skipped_by_key = (
+                key_by_id.get(task.skipped_by_task_id)
+                if task.skipped_by_task_id is not None
+                else None
+            )
+            views.append(WorkflowTaskView(
+                task=task,
+                depends_on=depends_map.get(task.task_key or "", []),
+                skipped_by_key=skipped_by_key,
+            ))
+
+        states = {t.state for t in tasks}
+        if states <= TERMINAL_STATES:
+            if states <= {TaskState.SUCCEEDED}:
+                wf_state = WORKFLOW_SUCCEEDED
+            else:
+                wf_state = WORKFLOW_FAILED
+        else:
+            wf_state = WORKFLOW_RUNNING
+
+        return WorkflowView(
+            workflow=workflow,
+            tasks=views,
+            state=wf_state,
+            state_counts=state_counts,
+        )
+
     # ---------- 取消 ----------
 
     async def cancel(self, task_id: str) -> Task:
@@ -181,14 +332,15 @@ class TaskService:
 
         now = time.time()
         if task.state in _QUEUED_STATES:
-            # 排队中：原子置为 CANCELLED（带状态守卫，防止恰被领取）
-            ok = await self._thread(
-                self.store.update_state,
+            # 排队中/阻塞中：原子置为 CANCELLED（带状态守卫，防止恰被领取）；
+            # 若属于某条流程，在同一事务内把未开始的下游级联带停为 SKIPPED。
+            settlement = await self._thread(
+                self.store.settle_terminal,
                 task_id, _QUEUED_STATES, TaskState.CANCELLED, now,
                 last_error="cancelled before execution",
                 error_kind="CANCELLED",
             )
-            if not ok:
+            if not settlement.changed:
                 # 与调度器竞争失败：任务可能已进入 RUNNING，刷新后改走运行中取消
                 task = await self.get_task(task_id)
                 if task.state in TERMINAL_STATES:
@@ -199,7 +351,8 @@ class TaskService:
                 self.logger.info(
                     "queued task cancelled",
                     extra={"task_id": task_id, "attempts": task.attempts,
-                           "decision": "CANCELLED"},
+                           "decision": f"CANCELLED skipped="
+                                       f"{len(settlement.skipped)}"},
                 )
                 return await self.get_task(task_id)
 

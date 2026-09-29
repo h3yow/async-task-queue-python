@@ -12,6 +12,11 @@ ERROR_KIND_NON_RETRYABLE = "NON_RETRYABLE"
 ERROR_KIND_TIMEOUT = "TIMEOUT"
 ERROR_KIND_CANCELLED = "CANCELLED"
 ERROR_KIND_UNKNOWN_TYPE = "UNKNOWN_TASK_TYPE"
+# 流程下游被上游带停时的原因类别（SKIPPED 任务的 error_kind）
+ERROR_KIND_UPSTREAM_FAILED = "UPSTREAM_FAILED"
+ERROR_KIND_UPSTREAM_DEAD_LETTER = "UPSTREAM_DEAD_LETTER"
+ERROR_KIND_UPSTREAM_CANCELLED = "UPSTREAM_CANCELLED"
+ERROR_KIND_UPSTREAM_TIMEOUT = "UPSTREAM_TIMEOUT"
 
 
 class TaskQueueError(Exception):
@@ -24,6 +29,14 @@ class UnknownTaskError(TaskQueueError):
     def __init__(self, task_id: str):
         super().__init__(f"unknown task: {task_id}")
         self.task_id = task_id
+
+
+class UnknownWorkflowError(TaskQueueError):
+    """查询了不存在的流程。"""
+
+    def __init__(self, workflow_id: str):
+        super().__init__(f"unknown workflow: {workflow_id}")
+        self.workflow_id = workflow_id
 
 
 class InvalidStateTransitionError(TaskQueueError):

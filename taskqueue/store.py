@@ -14,11 +14,19 @@ import json
 import sqlite3
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
-from taskqueue.models import TERMINAL_STATES, Task, TaskState
+from taskqueue.errors import (
+    ERROR_KIND_TIMEOUT,
+    ERROR_KIND_UPSTREAM_CANCELLED,
+    ERROR_KIND_UPSTREAM_DEAD_LETTER,
+    ERROR_KIND_UPSTREAM_FAILED,
+    ERROR_KIND_UPSTREAM_TIMEOUT,
+)
+from taskqueue.models import TERMINAL_STATES, Task, TaskState, Workflow
 
-_SCHEMA = """
+_SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS tasks (
     id               TEXT PRIMARY KEY,
     task_type        TEXT NOT NULL,
@@ -38,19 +46,82 @@ CREATE TABLE IF NOT EXISTS tasks (
     started_at       REAL,
     finished_at      REAL,
     lease_owner      TEXT,
-    lease_expires_at REAL
+    lease_expires_at REAL,
+    workflow_id      TEXT,
+    task_key         TEXT,
+    skipped_by_task_id TEXT
 );
+
+CREATE TABLE IF NOT EXISTS workflows (
+    id         TEXT PRIMARY KEY,
+    name       TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    workflow_id    TEXT NOT NULL,
+    task_key       TEXT NOT NULL,
+    depends_on_key TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, task_key, depends_on_key)
+);
+"""
+
+_SCHEMA_INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem
     ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_due
     ON tasks(state, not_before, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_workflow
+    ON tasks(workflow_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_deps_downstream
+    ON task_dependencies(workflow_id, depends_on_key);
+CREATE INDEX IF NOT EXISTS idx_deps_upstream
+    ON task_dependencies(workflow_id, task_key);
 """
+
+# 旧库升级：tasks 表补齐流程编排列（幂等，列已存在则跳过）
+_TASK_ADDED_COLUMNS = {
+    "workflow_id": "TEXT",
+    "task_key": "TEXT",
+    "skipped_by_task_id": "TEXT",
+}
 
 # 允许被调度器领取的状态
 _CLAIMABLE_STATES = (TaskState.PENDING.value, TaskState.RETRY_WAIT.value)
 
 # update_state 时不可由调用方直接覆写的内部字段
 _RESERVED_COLUMNS = {"id", "state"}
+
+# 非成功终态 -> 被带停下游的 error_kind（判定单一来源，整次传播用同一原因）
+_UPSTREAM_SKIP_KIND = {
+    TaskState.FAILED: ERROR_KIND_UPSTREAM_FAILED,
+    TaskState.CANCELLED: ERROR_KIND_UPSTREAM_CANCELLED,
+    TaskState.DEAD_LETTER: ERROR_KIND_UPSTREAM_DEAD_LETTER,
+}
+
+
+def _skip_kind_for(state: TaskState, error_kind: str | None) -> str:
+    """根据上游终态与具体 error_kind 决定下游带停原因。
+
+    超时会在用尽重试后进入 DEAD_LETTER（error_kind=TIMEOUT），这里将其细分
+    为 UPSTREAM_TIMEOUT，与普通死信区分；SKIPPED 根沿用其既有带停原因。
+    """
+    if state == TaskState.DEAD_LETTER and error_kind == ERROR_KIND_TIMEOUT:
+        return ERROR_KIND_UPSTREAM_TIMEOUT
+    return _UPSTREAM_SKIP_KIND[state]
+
+
+@dataclass
+class TerminalSettlement:
+    """终态结算结果。
+
+    changed=False 表示状态守卫不匹配（任务已被并发改动），此时不会做任何传播。
+    activated / skipped 仅在 changed=True 且任务属于某条流程时有意义。
+    """
+
+    changed: bool
+    activated: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
 
 _TASK_COLUMNS = [
     "id",
@@ -72,6 +143,9 @@ _TASK_COLUMNS = [
     "finished_at",
     "lease_owner",
     "lease_expires_at",
+    "workflow_id",
+    "task_key",
+    "skipped_by_task_id",
 ]
 
 
@@ -94,8 +168,19 @@ class TaskStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.executescript(_SCHEMA)
+        conn.executescript(_SCHEMA_TABLES)
+        # 旧库先补齐 tasks 新列，再创建引用这些列的索引，避免
+        # “no such column: workflow_id”。
+        self._migrate_tasks_columns(conn)
+        conn.executescript(_SCHEMA_INDEXES)
         self._conn = conn
+
+    @staticmethod
+    def _migrate_tasks_columns(conn: sqlite3.Connection) -> None:
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        for column, decl in _TASK_ADDED_COLUMNS.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -136,6 +221,9 @@ class TaskStore:
             "finished_at": task.finished_at,
             "lease_owner": task.lease_owner,
             "lease_expires_at": task.lease_expires_at,
+            "workflow_id": task.workflow_id,
+            "task_key": task.task_key,
+            "skipped_by_task_id": task.skipped_by_task_id,
         }
 
     @staticmethod
@@ -164,6 +252,9 @@ class TaskStore:
             finished_at=row["finished_at"],
             lease_owner=row["lease_owner"],
             lease_expires_at=row["lease_expires_at"],
+            workflow_id=row["workflow_id"],
+            task_key=row["task_key"],
+            skipped_by_task_id=row["skipped_by_task_id"],
         )
 
     # ---------- 读 ----------
@@ -196,6 +287,48 @@ class TaskStore:
         return self.connection.execute(
             "SELECT COUNT(*) FROM tasks WHERE state = ?", (state.value,)
         ).fetchone()[0]
+
+    # ---------- 流程读 ----------
+
+    @staticmethod
+    def _row_to_workflow(row: sqlite3.Row) -> Workflow:
+        return Workflow(id=row["id"], name=row["name"], created_at=row["created_at"])
+
+    def get_workflow(self, workflow_id: str) -> Workflow | None:
+        row = self.connection.execute(
+            "SELECT id, name, created_at FROM workflows WHERE id = ?",
+            (workflow_id,),
+        ).fetchone()
+        return self._row_to_workflow(row) if row is not None else None
+
+    def list_workflow_tasks(self, workflow_id: str) -> list[Task]:
+        rows = self.connection.execute(
+            f"SELECT {', '.join(_TASK_COLUMNS)} FROM tasks "
+            "WHERE workflow_id = ? ORDER BY created_at ASC, id ASC",
+            (workflow_id,),
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    def list_workflow_dependencies(
+        self, workflow_id: str
+    ) -> list[tuple[str, str]]:
+        """返回 (task_key, depends_on_key) 列表。"""
+        rows = self.connection.execute(
+            "SELECT task_key, depends_on_key FROM task_dependencies "
+            "WHERE workflow_id = ? ORDER BY task_key, depends_on_key",
+            (workflow_id,),
+        ).fetchall()
+        return [(r["task_key"], r["depends_on_key"]) for r in rows]
+
+    def list_open_workflow_ids(self) -> list[str]:
+        """返回仍含非终态任务的流程 id（去重）。"""
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
+        rows = self.connection.execute(
+            f"SELECT DISTINCT workflow_id FROM tasks "
+            f"WHERE workflow_id IS NOT NULL AND state NOT IN ({placeholders})",
+            tuple(s.value for s in TERMINAL_STATES),
+        ).fetchall()
+        return [r["workflow_id"] for r in rows]
 
     # ---------- 写 ----------
 
@@ -268,20 +401,11 @@ class TaskStore:
         assert fresh is not None
         return fresh
 
-    def update_state(
-        self,
-        task_id: str,
-        expected_state: TaskState | tuple[TaskState, ...] | None,
-        new_state: TaskState,
-        now: float | None = None,
-        **fields: Any,
-    ) -> bool:
-        """乐观状态更新。
-
-        - ``expected_state`` 为 None 时不检查当前状态；
-        - 可通过关键字字段更新 last_error/error_kind/not_before/result 等；
-        - 成功返回 True，状态不匹配（被并发改动）返回 False。
-        """
+    @staticmethod
+    def _prepare_fields(
+        new_state: TaskState, now: float | None, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        """把调用方字段转换为可直接写入的列映射（含 result_json/终态/租约处理）。"""
         for key in fields:
             if key in _RESERVED_COLUMNS:
                 raise ValueError(f"reserved column cannot be overwritten: {key}")
@@ -303,6 +427,23 @@ class TaskStore:
             # 离开 RUNNING 后释放租约
             field_map["lease_owner"] = None
             field_map["lease_expires_at"] = None
+        return field_map
+
+    def update_state(
+        self,
+        task_id: str,
+        expected_state: TaskState | tuple[TaskState, ...] | None,
+        new_state: TaskState,
+        now: float | None = None,
+        **fields: Any,
+    ) -> bool:
+        """乐观状态更新。
+
+        - ``expected_state`` 为 None 时不检查当前状态；
+        - 可通过关键字字段更新 last_error/error_kind/not_before/result 等；
+        - 成功返回 True，状态不匹配（被并发改动）返回 False。
+        """
+        field_map = self._prepare_fields(new_state, now, fields)
 
         # 参数顺序须与 SQL 占位符一致：state 在前，其后字段值，最后 id
         sets = ", ".join(f"{k} = ?" for k in field_map)
@@ -368,6 +509,290 @@ class TaskStore:
                 )
                 recovered.append(r["id"])
         return recovered
+
+    # ---------- 流程写 ----------
+
+    def insert_workflow(
+        self,
+        workflow: Workflow,
+        tasks: list[Task],
+        dependencies: list[tuple[str, str]],
+    ) -> None:
+        """在单事务内写入流程元数据、全部任务与依赖边。
+
+        - 无依赖的任务以 PENDING 写入，立即可被调度；
+        - 有依赖的任务以 BLOCKED 写入，不参与领取、不占并发名额。
+        幂等键唯一冲突或其它完整性冲突时整体回滚并抛出 IntegrityError。
+        """
+        now = workflow.created_at
+        with self._transaction():
+            self.connection.execute(
+                "INSERT INTO workflows (id, name, created_at) VALUES (?, ?, ?)",
+                (workflow.id, workflow.name, now),
+            )
+            for task in tasks:
+                row = self._task_to_row(task)
+                cols = ", ".join(row.keys())
+                marks = ", ".join("?" for _ in row)
+                self.connection.execute(
+                    f"INSERT INTO tasks ({cols}) VALUES ({marks})",
+                    tuple(row.values()),
+                )
+            for task_key, depends_on_key in dependencies:
+                self.connection.execute(
+                    "INSERT INTO task_dependencies "
+                    "(workflow_id, task_key, depends_on_key) VALUES (?, ?, ?)",
+                    (workflow.id, task_key, depends_on_key),
+                )
+
+    # ---------- 流程依赖传播（全部在单个写事务内完成） ----------
+
+    def settle_terminal(
+        self,
+        task_id: str,
+        expected_state: TaskState | tuple[TaskState, ...] | None,
+        new_state: TaskState,
+        now: float | None = None,
+        **fields: Any,
+    ) -> TerminalSettlement:
+        """以乐观守卫把任务落入终态，并在**同一事务**内传播依赖结果。
+
+        - 成功（SUCCEEDED）：把“依赖已全部成功”的直接下游 BLOCKED 任务激活为
+          PENDING，使其可被领取；
+        - 失败/死信/取消：把所有尚未开始的传递下游带停为 SKIPPED，并记录
+          ``skipped_by_task_id`` 与可区分的 ``error_kind``；
+        - 状态守卫不匹配（changed=False）时不写入、不传播，保证上游结果只有
+          一个权威判定，绝不会一边当成功激活、一边当失败带停。
+        """
+        field_map = self._prepare_fields(new_state, now, fields)
+        sets = ", ".join(f"{k} = ?" for k in field_map)
+        sql = "UPDATE tasks SET state = ?"
+        params: list[Any] = [new_state.value]
+        if sets:
+            sql += ", " + sets
+            params.extend(field_map.values())
+        sql += " WHERE id = ?"
+        params.append(task_id)
+
+        if expected_state is not None:
+            expected = (
+                (expected_state,)
+                if isinstance(expected_state, TaskState)
+                else tuple(expected_state)
+            )
+            marks = ",".join("?" for _ in expected)
+            sql += f" AND state IN ({marks})"
+            params.extend(s.value for s in expected)
+
+        result = TerminalSettlement(changed=False)
+        with self._transaction():
+            conn = self.connection
+            cur = conn.execute(sql, params)
+            if cur.rowcount != 1:
+                return result  # 守卫失败：什么都不做
+            result.changed = True
+
+            root = conn.execute(
+                f"SELECT {', '.join(_TASK_COLUMNS)} FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            workflow_id = root["workflow_id"]
+            if workflow_id is None:
+                return result  # 普通任务：无依赖传播
+
+            if new_state == TaskState.SUCCEEDED:
+                result.activated = self._activate_ready_dependents_tx(
+                    conn, workflow_id, root["task_key"], root["updated_at"]
+                )
+            else:
+                skip_kind = _skip_kind_for(new_state, root["error_kind"])
+                result.skipped = self._cascade_skip_tx(
+                    conn,
+                    workflow_id=workflow_id,
+                    root_task_id=task_id,
+                    root_task_key=root["task_key"],
+                    root_state=new_state,
+                    skip_kind=skip_kind,
+                    now=root["updated_at"],
+                )
+        return result
+
+    def _activate_ready_dependents_tx(
+        self,
+        conn: sqlite3.Connection,
+        workflow_id: str,
+        upstream_key: str,
+        now: float,
+    ) -> list[str]:
+        """成功传播：激活直接下游中“全部依赖都已成功”的 BLOCKED 任务。"""
+        activated: list[str] = []
+        candidates = [
+            r["task_key"]
+            for r in conn.execute(
+                "SELECT DISTINCT task_key FROM task_dependencies "
+                "WHERE workflow_id = ? AND depends_on_key = ?",
+                (workflow_id, upstream_key),
+            )
+        ]
+        for key in candidates:
+            row = conn.execute(
+                f"SELECT {', '.join(_TASK_COLUMNS)} FROM tasks "
+                "WHERE workflow_id = ? AND task_key = ?",
+                (workflow_id, key),
+            ).fetchone()
+            if row is None or row["state"] != TaskState.BLOCKED.value:
+                continue
+            unmet = conn.execute(
+                "SELECT 1 FROM task_dependencies d JOIN tasks t "
+                "ON t.workflow_id = d.workflow_id AND t.task_key = d.depends_on_key "
+                "WHERE d.workflow_id = ? AND d.task_key = ? "
+                "AND t.state <> ? LIMIT 1",
+                (workflow_id, key, TaskState.SUCCEEDED.value),
+            ).fetchone()
+            if unmet is not None:
+                continue
+            updated = conn.execute(
+                "UPDATE tasks SET state = ?, not_before = ?, updated_at = ? "
+                "WHERE id = ? AND state = ?",
+                (TaskState.PENDING.value, now, now, row["id"],
+                 TaskState.BLOCKED.value),
+            )
+            if updated.rowcount == 1:
+                activated.append(row["id"])
+        return activated
+
+    def _cascade_skip_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        workflow_id: str,
+        root_task_id: str,
+        root_task_key: str,
+        root_state: TaskState,
+        skip_kind: str,
+        now: float,
+    ) -> list[str]:
+        """失败传播：把尚未开始的传递下游带停为 SKIPPED。
+
+        队列元素携带 (任务key, 直接上游id, 直接上游state)。被带停任务记录的是
+        触发它的“直接上游”，便于查询具体被谁带停；error_kind 全链路统一取自
+        根任务终态，保证同一次传播原因一致、可区分。
+        """
+        skipped: list[str] = []
+        # (task_key, upstream_id, upstream_state)
+        queue: list[tuple[str, str, TaskState]] = [
+            (root_task_key, root_task_id, root_state)
+        ]
+        while queue:
+            parent_key, parent_id, parent_state = queue.pop(0)
+            children = conn.execute(
+                "SELECT DISTINCT task_key FROM task_dependencies "
+                "WHERE workflow_id = ? AND depends_on_key = ?",
+                (workflow_id, parent_key),
+            ).fetchall()
+            for child in children:
+                child_key = child["task_key"]
+                row = conn.execute(
+                    f"SELECT {', '.join(_TASK_COLUMNS)} FROM tasks "
+                    "WHERE workflow_id = ? AND task_key = ?",
+                    (workflow_id, child_key),
+                ).fetchone()
+                if row is None:
+                    continue
+                child_state = TaskState(row["state"])
+                if child_state in TERMINAL_STATES:
+                    # 已终结（例如早已成功）：不覆盖。沿其下游继续的传播由
+                    # reconcile 或该节点自身的结算负责，此处跳过即可。
+                    continue
+                if child_state == TaskState.RUNNING:
+                    # 不变量：上游未成功时下游不可能被领取；防御性跳过。
+                    continue
+                message = (
+                    f"skipped: upstream task {parent_id} ended with "
+                    f"{parent_state.value}"
+                )
+                updated = conn.execute(
+                    "UPDATE tasks SET state = ?, error_kind = ?, last_error = ?, "
+                    "skipped_by_task_id = ?, finished_at = ?, updated_at = ?, "
+                    "lease_owner = NULL, lease_expires_at = NULL "
+                    "WHERE id = ? AND state NOT IN "
+                    "('SUCCEEDED','FAILED','CANCELLED','DEAD_LETTER','SKIPPED')",
+                    (TaskState.SKIPPED.value, skip_kind, message, parent_id,
+                     now, now, row["id"]),
+                )
+                if updated.rowcount == 1:
+                    skipped.append(row["id"])
+                    queue.append((child_key, row["id"], TaskState.SKIPPED))
+        return skipped
+
+    def reconcile_workflows(self, now: float) -> dict[str, TerminalSettlement]:
+        """启动对账：修复崩溃窗口中“上游已结算、下游未传播”的流程。
+
+        逐条流程处理（每条一个事务）：
+        - 存在非成功终态上游的 BLOCKED/排队任务 -> 级联 SKIPPED；
+        - 全部依赖已成功的 BLOCKED 任务 -> 激活 PENDING。
+        已成功任务保持不动（绝不重跑）；RUNNING 已由 recover_orphans 先退回
+        PENDING，故此处只需处理排队态。幂等，可重复执行。
+        """
+        results: dict[str, TerminalSettlement] = {}
+        for workflow_id in self.list_open_workflow_ids():
+            with self._transaction():
+                conn = self.connection
+                tasks = self.list_workflow_tasks(workflow_id)
+                settlement = TerminalSettlement(changed=True)
+
+                # 1) 失败传播：以每个非成功终态任务为根做级联带停
+                for task in tasks:
+                    if task.state not in (
+                        TaskState.FAILED,
+                        TaskState.CANCELLED,
+                        TaskState.DEAD_LETTER,
+                        TaskState.SKIPPED,
+                    ):
+                        continue
+                    if task.state == TaskState.SKIPPED:
+                        kind = task.error_kind or ERROR_KIND_UPSTREAM_FAILED
+                    else:
+                        kind = _skip_kind_for(task.state, task.error_kind)
+                    settlement.skipped.extend(self._cascade_skip_tx(
+                        conn,
+                        workflow_id=workflow_id,
+                        root_task_id=task.id,
+                        root_task_key=task.task_key,
+                        root_state=task.state,
+                        skip_kind=kind,
+                        now=now,
+                    ))
+
+                # 2) 成功传播：刷新视图后激活依赖全部成功的 BLOCKED 任务
+                fresh_rows = conn.execute(
+                    f"SELECT {', '.join(_TASK_COLUMNS)} FROM tasks "
+                    "WHERE workflow_id = ? ORDER BY created_at ASC, id ASC",
+                    (workflow_id,),
+                ).fetchall()
+                for row in fresh_rows:
+                    if row["state"] != TaskState.BLOCKED.value:
+                        continue
+                    key = row["task_key"]
+                    unmet = conn.execute(
+                        "SELECT 1 FROM task_dependencies d JOIN tasks t "
+                        "ON t.workflow_id = d.workflow_id "
+                        "AND t.task_key = d.depends_on_key "
+                        "WHERE d.workflow_id = ? AND d.task_key = ? "
+                        "AND t.state <> ? LIMIT 1",
+                        (workflow_id, key, TaskState.SUCCEEDED.value),
+                    ).fetchone()
+                    if unmet is None:
+                        updated = conn.execute(
+                            "UPDATE tasks SET state = ?, not_before = ?, "
+                            "updated_at = ? WHERE id = ? AND state = ?",
+                            (TaskState.PENDING.value, now, now, row["id"],
+                             TaskState.BLOCKED.value),
+                        )
+                        if updated.rowcount == 1:
+                            settlement.activated.append(row["id"])
+            results[workflow_id] = settlement
+        return results
 
 
 class IdempotencyKeyTaken(Exception):
