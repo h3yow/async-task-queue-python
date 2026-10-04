@@ -23,7 +23,11 @@ from taskqueue.models import (
     TaskState,
 )
 
-_SCHEMA = """
+#: 基础结构：只依赖“最初版本就存在”的列，旧库执行也不会失败。
+#: 注意 CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，因此凡是引用
+#: 后续版本新增列（flow_id 等）的索引，一律放到迁移完成之后再建
+#: （见 _POST_MIGRATION_SCHEMA），否则旧库启动会直接报 no such column。
+_CORE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id               TEXT PRIMARY KEY,
     task_type        TEXT NOT NULL,
@@ -52,8 +56,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem
     ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_due
     ON tasks(state, not_before, priority, created_at);
-CREATE INDEX IF NOT EXISTS idx_tasks_flow
-    ON tasks(flow_id);
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
     task_id    TEXT NOT NULL,
@@ -64,7 +66,13 @@ CREATE INDEX IF NOT EXISTS idx_deps_upstream
     ON task_dependencies(depends_on);
 """
 
-#: 旧库缺列时按名补齐（轻量迁移）
+#: 迁移（补列）完成后才能创建的、引用新列的结构。
+_POST_MIGRATION_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_tasks_flow
+    ON tasks(flow_id);
+"""
+
+#: 旧库缺列时按名补齐（轻量迁移，幂等：已存在则跳过）
 _TASK_COLUMN_MIGRATIONS = (
     ("flow_id", "ALTER TABLE tasks ADD COLUMN flow_id TEXT"),
     ("flow_key", "ALTER TABLE tasks ADD COLUMN flow_key TEXT"),
@@ -125,12 +133,20 @@ class TaskStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.executescript(_SCHEMA)
+        # 顺序必须是：建基础表 -> 给旧表补列 -> 再建引用新列的索引。
+        # 旧版本数据库的 tasks 表没有 flow_id 等列，若先建索引会直接报错。
+        conn.executescript(_CORE_SCHEMA)
         self._conn = conn
         self._migrate()
+        conn.executescript(_POST_MIGRATION_SCHEMA)
 
     def _migrate(self) -> None:
-        """为旧版本创建的库补齐新增列（幂等）。"""
+        """为旧版本创建的库补齐新增列（幂等，可反复执行）。
+
+        每条 ALTER 独立提交：SQLite 无法在事务内回滚 ALTER TABLE，
+        拆开后“已补过的列跳过、缺的列补上”，对同一数据库重复启动结果一致。
+        迁移只新增可空列，绝不改动或删除任何已有数据。
+        """
         cols = {
             row["name"]
             for row in self.connection.execute("PRAGMA table_info(tasks)")
