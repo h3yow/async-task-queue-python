@@ -23,7 +23,9 @@ from taskqueue.models import (
     TaskState,
 )
 
-_SCHEMA = """
+# 建表与建索引分开：旧库上 tasks 表已存在但缺新列，
+# 必须先补列（_migrate）再建引用新列的索引，否则打开旧库直接报错。
+_SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS tasks (
     id               TEXT PRIMARY KEY,
     task_type        TEXT NOT NULL,
@@ -48,18 +50,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     flow_key         TEXT,
     blocked_by       TEXT
 );
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id    TEXT NOT NULL,
+    depends_on TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on)
+);
+"""
+
+_SCHEMA_INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem
     ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_due
     ON tasks(state, not_before, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_flow
     ON tasks(flow_id);
-
-CREATE TABLE IF NOT EXISTS task_dependencies (
-    task_id    TEXT NOT NULL,
-    depends_on TEXT NOT NULL,
-    PRIMARY KEY (task_id, depends_on)
-);
 CREATE INDEX IF NOT EXISTS idx_deps_upstream
     ON task_dependencies(depends_on);
 """
@@ -125,9 +129,11 @@ class TaskStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.executescript(_SCHEMA)
+        conn.executescript(_SCHEMA_TABLES)
         self._conn = conn
         self._migrate()
+        # 索引依赖迁移后的新列（如 flow_id），必须最后建
+        self.connection.executescript(_SCHEMA_INDEXES)
 
     def _migrate(self) -> None:
         """为旧版本创建的库补齐新增列（幂等）。"""

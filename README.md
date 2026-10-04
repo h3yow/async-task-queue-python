@@ -175,6 +175,61 @@ last_error / blocked_by / finished_at` 等）。整体状态由成员任务推�
   - 已用满次数的任务在最后一次重试失败后进入死信，总次数不超过 `max_attempts`；
   - `RETRY_WAIT/PENDING` 任务原样保留，到期继续；终态任务永不重复执行。
 
+## 沿用旧版本数据库（schema 自动升级）
+
+依赖/流程能力为 `tasks` 表新增了 `flow_id / flow_key / blocked_by` 三列，
+并新增 `task_dependencies` 表与相关索引。**直接拿上一版创建的数据库文件
+启动即可**，服务在连接时自动完成轻量迁移，不会报错退出：
+
+- 迁移顺序固定为「建表（缺才建）→ 按名补齐缺失列 → 建索引」，
+  索引永远排在补列之后，因此旧库缺列不会导致启动失败；
+- 迁移**幂等可重复**：对同一个库反复启动/重启结果一致，
+  不报错、不丢任务、不改坏状态；
+- 老任务的所有字段（状态、结果、错误信息、attempts、幂等键）原样保留，
+  升级后照常查询；老任务的新列为 `NULL`，语义等同普通单任务；
+- 老库中未终结的任务升级后继续按既有语义处理：
+  `PENDING/RETRY_WAIT` 到期继续调度，遗留 `RUNNING` 按孤儿恢复重跑；
+- 升级后流程能力立即可用：可在该库上提交带依赖的流程，
+  重启后流程接着推进，已成功的上游不重跑，
+  因上游未成功而停下的下游会被收尾为 `SKIPPED` 而不是一直挂着；
+- 全新空库的行为与之前完全一致（直接建出完整 schema）。
+
+本地手动验证（用上一版格式的库启动）：
+
+```bash
+# 1) 用上一版建表语句准备一个“老库”并写入一条任务
+python - <<'EOF'
+import sqlite3
+conn = sqlite3.connect("legacy.db")
+conn.executescript("""
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, task_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+    idempotency_key TEXT, state TEXT NOT NULL, priority INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL,
+    timeout REAL NOT NULL, not_before REAL NOT NULL DEFAULT 0,
+    result_json TEXT, last_error TEXT, error_kind TEXT,
+    created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    started_at REAL, finished_at REAL, lease_owner TEXT, lease_expires_at REAL
+);
+""")
+conn.execute(
+    "INSERT INTO tasks VALUES ('old-1','flaky','{}',NULL,'PENDING',0,0,3,"
+    "60,0,NULL,NULL,NULL,0,0,NULL,NULL,NULL,NULL)")
+conn.commit(); conn.close()
+EOF
+
+# 2) 直接指向老库启动：正常起来，老任务被继续调度
+TASKQUEUE_DB=legacy.db uv run uvicorn main:app
+curl -s localhost:8000/tasks/old-1    # 状态/结果可查，PENDING 会被执行
+
+# 3) 老库上提交流程、重启后续跑，行为与新库一致
+curl -s -X POST localhost:8000/flows -H 'content-type: application/json' -d '{
+  "tasks": [{"key":"a","task_type":"flaky"},
+            {"key":"b","task_type":"flaky","depends_on":["a"]}]}'
+```
+
+自动化覆盖见 `tests/test_migration.py`（用上一版格式的真实库文件驱动）。
+
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -229,7 +284,7 @@ async def long_job(payload, ctx):
 # 安装依赖（含 pytest / httpx / ruff）
 uv sync
 
-# 运行全部测试（48 个，含并发幂等、重试成功、死信、流程编排、重启恢复等）
+# 运行全部测试（58 个，含并发幂等、重试成功、死信、流程编排、重启恢复、旧库升级等）
 uv run pytest -q
 
 # 静态检查
@@ -270,6 +325,10 @@ curl -s localhost:8000/flows/<flow_id>
 | 上游失败/死信/取消带停下游且原因可区分 | `test_upstream_failure_skips_downstream_with_reason` / `test_upstream_dead_letter_skips_downstream` / `test_upstream_cancelled_while_running_skips_downstream` |
 | 流程进度视图 | `test_flow_progress_view_mid_flight` |
 | 重启后流程继续推进、已成功上游不重跑 | `test_restart_continues_flow_without_rerunning_succeeded` / `test_restart_skips_downstream_of_failed_upstream` / `test_restart_recovers_running_upstream_and_continues` |
+| 旧版本数据库启动不报错、老任务原样保留 | `tests/test_migration.py::test_service_starts_on_legacy_db_and_preserves_tasks` / `test_legacy_db_gains_new_schema_objects` |
+| 旧库未完成任务升级后继续调度 / 孤儿恢复 | `test_legacy_pending_task_is_scheduled_after_upgrade` / `test_legacy_running_task_is_recovered_after_upgrade` |
+| 旧库上流程编排、带停、重启续跑不重跑 | `test_flow_runs_on_upgraded_legacy_db` / `test_flow_on_legacy_db_skips_downstream_of_failed_upstream` / `test_restart_on_upgraded_db_continues_flow_without_rerun` |
+| 升级幂等可重复 / 新库行为不变 | `test_repeated_restarts_on_legacy_db_are_idempotent` / `test_store_connect_is_idempotent_on_legacy_db` / `test_fresh_db_has_full_schema` |
 | 流程 API 端到端 | `tests/test_api.py::test_flow_submit_and_progress_via_api` 等 |
 
 ## 日志
